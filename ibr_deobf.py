@@ -147,7 +147,7 @@ class IDASymbolicExecutionEngine(SymbolicExecutionEngine):
         if isinstance(addr_expr, ExprInt):
             addr = int(addr_expr)
             size = expr.size // 8
-            # Read directly from IDA Pro active database
+            # Read directly from IDA active database
             if size == 8:
                 val = idc.get_qword(addr)
             elif size == 4:
@@ -254,10 +254,10 @@ def backward_slice(addr, reg=None):
     # Sort by address for printing
     slice_instructions = sorted(slice_instructions, key=lambda x: x[0])
     
-    # print("  --- Slice ---")
-    # for ea, disasm in slice_instructions:
-    #     print(f"    {ea:#x}: {disasm}")
-    # print("  -------------")
+    print("  --- Slice ---")
+    for ea, disasm in slice_instructions:
+        print(f"    {ea:#x}: {disasm}")
+    print("  -------------")
     
     return slice_instructions
 
@@ -305,8 +305,74 @@ def emulate_slice_for_val(remaining_eas, setcc_reg_family, setcc_val, jmp_reg, g
         return int(final_val), updated_regs
     return None, updated_regs
 
+def emulate_pre_cmov(pre_eas, global_regs, machine, lifter, mdis, container, loc_db):
+    if not pre_eas:
+        return {k.upper(): v for k, v in global_regs.items()}
+        
+    asmcfg = AsmCFG(loc_db)
+    block = AsmBlock(loc_db, loc_db.gen_loc_key())
+    for ea in pre_eas:
+        instr = mdis.dis_instr(ea)
+        block.lines.append(instr)
+    asmcfg.add_block(block)
+    
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    
+    init_state = {}
+    for reg_name, val in global_regs.items():
+        init_state[ExprId(reg_name.upper(), 64)] = ExprInt(val, 64)
+        
+    engine = IDASymbolicExecutionEngine(lifter, container, init_state)
+    engine.eval_updt_irblock(list(ircfg.blocks.values())[0])
+    
+    GP_REGS = ['RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'RSP', 'RBP', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
+    updated_regs = {}
+    for reg_name in GP_REGS:
+        reg_id = ExprId(reg_name, 64)
+        val = engine.symbols.read(reg_id)
+        if isinstance(val, ExprInt):
+            updated_regs[reg_name] = int(val)
+            
+    return updated_regs
+
+def emulate_post_cmov(post_eas, dst_reg_family, override_val, pre_regs, machine, lifter, mdis, container, loc_db, jmp_reg):
+    if not post_eas:
+        return override_val, pre_regs
+        
+    asmcfg = AsmCFG(loc_db)
+    block = AsmBlock(loc_db, loc_db.gen_loc_key())
+    for ea in post_eas:
+        instr = mdis.dis_instr(ea)
+        block.lines.append(instr)
+    asmcfg.add_block(block)
+    
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    
+    init_state = {}
+    for reg_name, val in pre_regs.items():
+        init_state[ExprId(reg_name.upper(), 64)] = ExprInt(val, 64)
+        
+    init_state[ExprId(dst_reg_family.upper(), 64)] = ExprInt(override_val, 64)
+    
+    engine = IDASymbolicExecutionEngine(lifter, container, init_state)
+    engine.eval_updt_irblock(list(ircfg.blocks.values())[0])
+    
+    final_val = engine.eval_expr(ExprId(jmp_reg.upper(), 64))
+    
+    GP_REGS = ['RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'RSP', 'RBP', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
+    updated_regs = {}
+    for reg_name in GP_REGS:
+        reg_id = ExprId(reg_name, 64)
+        val = engine.symbols.read(reg_id)
+        if isinstance(val, ExprInt):
+            updated_regs[reg_name] = int(val)
+            
+    if isinstance(final_val, ExprInt):
+        return int(final_val), updated_regs
+    return None, updated_regs
+
 def main():
-    # Initialize Miasm elements using the binary file currently open in IDA Pro
+    # Initialize Miasm elements using the binary file currently open in IDA
     loc_db = LocationDB()
     filepath = idc.get_input_file_path()
     with open(filepath, "rb") as f:
@@ -344,12 +410,16 @@ def main():
         # Get backward slice
         slice_instrs = backward_slice(addr, reg)
         
-        # Find if slice has a setcc instruction (e.g. setl, setnz)
+        # Find if slice has a setcc or cmovcc instruction
         setcc_idx = -1
+        cmov_idx = -1
         for i, (ea, _) in enumerate(slice_instrs):
             mnem = idc.print_insn_mnem(ea).lower()
             if mnem.startswith('set'):
                 setcc_idx = i
+                break
+            elif mnem.startswith('cmov'):
+                cmov_idx = i
                 break
                 
         if setcc_idx != -1:
@@ -380,20 +450,74 @@ def main():
                 idc.set_cmt(addr, comment, 0)
                 # print(f"  [+] Added comment to {addr:#x}")
                 
-                # Patch in IDA Pro database
-                jmp_size = idc.get_item_size(addr)
-                cond_name = idc.print_insn_mnem(setcc_addr).lower()[3:]
-                slice_eas = {item[0] for item in slice_instrs}
-                success = patch_indirect_jump_restore_non_slice(setcc_addr, addr, jmp_size, slice_eas, dest_true, dest_false, cond_name)
-                if success:
-                    print(f"  [+] Patched jump block at {setcc_addr:#x} successfully.")
+                # Patch in IDA database
+                # jmp_size = idc.get_item_size(addr)
+                # cond_name = idc.print_insn_mnem(setcc_addr).lower()[3:]
+                # slice_eas = {item[0] for item in slice_instrs}
+                # success = patch_indirect_jump_restore_non_slice(setcc_addr, addr, jmp_size, slice_eas, dest_true, dest_false, cond_name)
+                # if success:
+                #     print(f"  [+] Patched jump block at {setcc_addr:#x} successfully.")
                 
                 # Propagate registers (e.g. from the True branch)
                 global_regs.update(regs_true)
-        #     else:
-        #         print(f"  [-] Failed to resolve destinations dynamically.")
-        # else:
-        #     print(f"  [-] No setcc instruction found in slice.")
+            else:
+                print(f"  [-] Failed to resolve destinations dynamically.")
+        elif cmov_idx != -1:
+            cmov_addr, _ = slice_instrs[cmov_idx]
+            dst_reg = idc.print_operand(cmov_addr, 0)
+            src_reg = idc.print_operand(cmov_addr, 1)
+            
+            dst_family = get_reg_family(dst_reg)
+            src_family = get_reg_family(src_reg)
+            
+            # 1. Pre-cmov emulation: remaining instructions before cmov_addr
+            pre_eas = [ea for ea, _ in slice_instrs[:cmov_idx]]
+            pre_regs = emulate_pre_cmov(
+                pre_eas, global_regs, machine, lifter, mdis, container, loc_db
+            )
+            
+            if pre_regs is not None:
+                # Get the values of dst and src registers before cmov
+                val_dst = pre_regs.get(dst_family.upper(), 0)
+                val_src = pre_regs.get(src_family.upper(), 0)
+                
+                # Post-cmov instructions after cmov_addr (excluding JMP instruction itself)
+                post_eas = [ea for ea, _ in slice_instrs[cmov_idx + 1 : -1]]
+                
+                # Emulate Case True: dst = val_src
+                dest_true, regs_true = emulate_post_cmov(
+                    post_eas, dst_family, val_src, pre_regs,
+                    machine, lifter, mdis, container, loc_db, reg
+                )
+                
+                # Emulate Case False: dst = val_dst
+                dest_false, regs_false = emulate_post_cmov(
+                    post_eas, dst_family, val_dst, pre_regs,
+                    machine, lifter, mdis, container, loc_db, reg
+                )
+                
+                if dest_true is not None and dest_false is not None:
+                    print(f"  [+] Resolved destinations (cmov) -> True: {dest_true:#x} | False: {dest_false:#x}")
+                    
+                    comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
+                    idc.set_cmt(addr, comment, 0)
+                    # print(f"  [+] Added comment to {addr:#x}")
+                    
+                    # Patch in IDA database
+                    # jmp_size = idc.get_item_size(addr)
+                    # cond_name = idc.print_insn_mnem(cmov_addr).lower()[4:]
+                    # slice_eas = {item[0] for item in slice_instrs}
+                    # success = patch_indirect_jump_restore_non_slice(cmov_addr, addr, jmp_size, slice_eas, dest_true, dest_false, cond_name)
+                    # if success:
+                    #     print(f"  [+] Patched jump block at {cmov_addr:#x} successfully.")
+                        
+                    global_regs.update(regs_true)
+                else:
+                    print(f"  [-] Failed to resolve cmov destinations dynamically.")
+            else:
+                print(f"  [-] Failed pre-cmov emulation.")
+        else:
+            print(f"  [-] No setcc/cmovcc instruction found in slice.")
 
 if __name__ == "__main__":
     main()
