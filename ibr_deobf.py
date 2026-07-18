@@ -164,8 +164,26 @@ class IDASymbolicExecutionEngine(SymbolicExecutionEngine):
         return super().mem_read(expr)
 
 def find_jmp_reg_addr(jumps_addr):
-    # Iterate through all instructions (heads) in the database
-    for ea in idautils.Heads():
+    # Find the .text segment or default to the first segment
+    text_seg = None
+    first_seg = None
+    for seg in idautils.Segments():
+        if first_seg is None:
+            first_seg = seg
+        name = idc.get_segm_name(seg)
+        if name == ".text":
+            text_seg = seg
+            break
+
+    target_seg = text_seg if text_seg is not None else first_seg
+    if target_seg is None:
+        return
+
+    start = idc.get_segm_start(target_seg)
+    end = idc.get_segm_end(target_seg)
+
+    # Iterate through all instructions (heads) in the target segment
+    for ea in idautils.Heads(start, end):
         # Check if the head is classified as code
         if not idc.is_code(idc.get_full_flags(ea)):
             continue
@@ -410,9 +428,10 @@ def main():
         # Get backward slice
         slice_instrs = backward_slice(addr, reg)
         
-        # Find if slice has a setcc or cmovcc instruction
+        # Find if slice has a setcc, cmovcc, or lea pattern
         setcc_idx = -1
         cmov_idx = -1
+        lea_idx = -1
         for i, (ea, _) in enumerate(slice_instrs):
             mnem = idc.print_insn_mnem(ea).lower()
             if mnem.startswith('set'):
@@ -421,8 +440,53 @@ def main():
             elif mnem.startswith('cmov'):
                 cmov_idx = i
                 break
+            elif mnem.startswith('lea'):
+                op0 = idc.print_operand(ea, 0).lower()
+                op1 = idc.print_operand(ea, 1).lower().replace(' ', '')
+                if op0 in ['rcx', 'ecx'] and 'rcx*8' in op1:
+                    lea_idx = i
+                    break
+                    
+        if lea_idx != -1:
+            lea_addr, _ = slice_instrs[lea_idx]
+            
+            # 1. Pre-lea emulation: instructions before lea_addr
+            pre_eas = [ea for ea, _ in slice_instrs[:lea_idx]]
+            pre_regs = emulate_pre_cmov(
+                pre_eas, global_regs, machine, lifter, mdis, container, loc_db
+            )
+            
+            if pre_regs is not None:
+                # Post-lea instructions after lea_addr (excluding JMP instruction itself)
+                post_eas = [ea for ea, _ in slice_instrs[lea_idx : -1]]
                 
-        if setcc_idx != -1:
+                # Emulate Case True: RCX = 1
+                dest_true, regs_true = emulate_post_cmov(
+                    post_eas, 'rcx', 1, pre_regs,
+                    machine, lifter, mdis, container, loc_db, reg
+                )
+                
+                # Emulate Case False: RCX = 0
+                dest_false, regs_false = emulate_post_cmov(
+                    post_eas, 'rcx', 0, pre_regs,
+                    machine, lifter, mdis, container, loc_db, reg
+                )
+                
+                if dest_true is not None and dest_false is not None:
+                    print(f"  [+] Resolved destinations (lea) -> True: {dest_true:#x} | False: {dest_false:#x}")
+                    
+                    comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
+                    idc.set_cmt(addr, comment, 0)
+                    # print(f"  [+] Added comment to {addr:#x}")
+                    
+                    # Propagate registers (e.g. from the True branch)
+                    global_regs.update(regs_true)
+                else:
+                    print(f"  [-] Failed to resolve lea destinations dynamically.")
+            else:
+                print(f"  [-] Failed pre-lea emulation.")
+                
+        elif setcc_idx != -1:
             setcc_addr, _ = slice_instrs[setcc_idx]
             setcc_reg = idc.print_operand(setcc_addr, 0)
             setcc_reg_family = get_reg_family(setcc_reg)
@@ -517,7 +581,7 @@ def main():
             else:
                 print(f"  [-] Failed pre-cmov emulation.")
         else:
-            print(f"  [-] No setcc/cmovcc instruction found in slice.")
+            print(f"  [-] No setcc/cmovcc/lea instruction found in slice.")
 
 if __name__ == "__main__":
     main()
