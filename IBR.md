@@ -6,11 +6,11 @@ Compile một chương trình bằng ollvm với pass indirect branch
 
 ## Phân tích pattern của file ví dụ (setcc)
 
-![image-20260716103135464](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716103135464.png)
+<img width="740" height="428" alt="image-20260716103135464" src="https://github.com/user-attachments/assets/6415e9bc-3fd1-492e-a082-249701a0dde3" />
 
-![image-20260716103205562](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716103205562.png)
+<img width="872" height="424" alt="image-20260716103205562" src="https://github.com/user-attachments/assets/9fd5485c-66b9-494a-9207-1df33ec94918" />
 
-![image-20260716104043148](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716104043148.png)
+<img width="618" height="201" alt="image-20260716104043148" src="https://github.com/user-attachments/assets/4042aced-15ab-4307-ab90-1f8846d9a2c1" />
 
 Do chương trình không biết được giá trị chính xác của thanh ghi rax cho nên trong pseudocode bị cắt ngắn, không biết được toàn bộ luồng hoạt động của chương trình
 
@@ -163,7 +163,7 @@ Mỗi pattern chạy pha 2 **hai lần** để thu được 2 địa chỉ đíc
 
 - Có một số hàm trong chương trình sẽ đưa base jumptable hoặc 1 giá trị vào 1 thanh ghi sau đó tái sử dụng lại cho các lệnh sau 
 
-![image-20260716171652783](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716171652783.png)
+<img width="807" height="506" alt="image-20260716171652783" src="https://github.com/user-attachments/assets/2054227c-631c-4398-8622-a2d8a88cca2c" />
 
 Địa chỉ của Jumptable được đưa vào rbx và một giá trị được đưa vào r14, sau khi lệnh `0x14000105E jmp rax` được thực thi đến `loc_140001070` sẽ sử dụng lại rbx và r14 trước đó
 
@@ -191,11 +191,11 @@ Script tự tạo bytecode cho lệnh jump:
 
 ### Kết quả
 
-![image-20260716194300638](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716194300638.png)
+<img width="562" height="204" alt="image-20260716194300638" src="https://github.com/user-attachments/assets/cde4ea93-c504-4d92-84fd-a00d80d2be4a" />
 
-![image-20260716194322513](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716194322513.png)
+<img width="630" height="520" alt="image-20260716194322513" src="https://github.com/user-attachments/assets/30a61b84-98d4-411e-9fbf-433fae594141" />
 
-![image-20260716194346116](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260716194346116.png)
+<img width="913" height="439" alt="image-20260716194346116" src="https://github.com/user-attachments/assets/76216cd5-638c-4610-acd2-59f87913525d" />
 
 ## Phân tích pattern của sample EarthLamia (setcc, cmovcc)
 
@@ -203,7 +203,7 @@ Dùng script deobf file test cho sample EarthLamia chỉ có một số jmp reg 
 
 Số còn lại chưa resolve được là do lệnh CMOVCC. Lệnh CMOV được sử dụng để lấy offset của 1 giá trị trong jumptable
 
-![image-20260717103528894](C:\Users\admin\AppData\Roaming\Typora\typora-user-images\image-20260717103528894.png)
+<img width="930" height="407" alt="image-20260717103528894" src="https://github.com/user-attachments/assets/1b183bdd-ff30-40fc-bc28-83941f3a7a20" />
 
 ### Xử lý CMOVCC
 
