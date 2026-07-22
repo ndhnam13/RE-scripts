@@ -220,3 +220,102 @@ Hướng trace ngược vẫn sử dụng đúng ý tưởng backward slicing nh
 2. Post-CMOV: Symbolic execute từ sau CMOV với 2 trường hợp:
    - Điều kiện đúng: `dst = val_src` (move xảy ra) -> tính địa chỉ nhánh True
    - Điều kiện sai: `dst = val_dst` (giữ nguyên) -> tính địa chỉ nhánh False
+
+## Phân tích pattern mẫu PlugX
+
+### Pattern 1
+
+Hướng giải quyết:
+
+- Tìm jmp reg đầu hàm sau đó backward slice và symbex resolve được 2 T/F
+
+- Đi đến nhánh T, lưu lại nhánh F
+
+- Lưu lại cả địa chỉ của các nhánh đã được resolve
+
+- Tìm `JMP REG` trong nhánh T, backward slice đến hết nhánh T, nếu `tracked_regs` vẫn còn, tiếp tục backward slice từ địa chỉ của của `JMP REG` nhánh trước đó tiếp tục đến khi không `tracked_regs` rỗng, symbex slice để resolve T/F, lại đi đến nhánh T và lưu lại nhánh F
+
+- Đối với các nhánh đã resolve bỏ qua khi gặp lại
+
+- Tiếp tục làm như vậy cho đến khi resolve hết tất cả các nhánh
+
+Ví dụ:
+
+Đây là `JMP REG` đầu tiên của hàm
+
+```assembly
+.text:10025DF3 loc_10025DF3:                           ; CODE XREF: fn_decrypt_config+D2↑j
+.text:10025DF3                 lea     ecx, [esp+64h+var_46]
+.text:10025DF7                 mov     eax, [ecx-0Ah]
+.text:10025DFA                 mov     byte ptr [eax+6], 0
+.text:10025DFE                 mov     edx, [ecx-0Ah]
+.text:10025E01                 call    sub_10026D8C
+.text:10025E06                 lea     ecx, [esp+0Ch+arg_24]
+.text:10025E0A                 push    4
+.text:10025E0C                 push    ecx
+.text:10025E0D                 push    offset byte_100480AC
+.text:10025E12                 call    eax
+.text:10025E14                 add     esp, 0Ch
+.text:10025E17                 test    eax, eax
+.text:10025E19                 setz    byte ptr [esp+3]
+.text:10025E1E                 mov     eax, 1976796641
+.text:10025E23                 mov     ebx, 1395262558
+.text:10025E28                 mov     edx, dword_10040870
+.text:10025E2E                 lea     ecx, [edx-1738205772]
+.text:10025E34                 lea     edi, [edx-1738205768]
+.text:10025E3A                 add     edx, 2556761844
+.text:10025E40                 cmp     eax, 164689989
+.text:10025E45                 cmovge  edx, edi
+.text:10025E48                 mov     edx, [edx]
+.text:10025E4A                 add     edx, ebx
+.text:10025E4C                 jmp     edx             ; True: 0x10026465
+.text:10025E4C                                         ; False: 0x10025e4e
+```
+
+Sau khi resolve đi tới nhánh True tại 0x10026465, quét từ đây xuống gặp `JMP EDX`
+
+```assembly
+.text:10026459                 add     ecx, 986515B4h
+.text:1002645F                 mov     edx, [edx]
+.text:10026461                 add     edx, ebx
+.text:10026463                 jmp     edx
+.text:10026465 loc_10026465:                           ; CODE XREF: fn_decrypt_config+14C↑j
+.text:10026465                 lea     edx, [ecx+13Ch]
+.text:1002646B                 lea     edi, [ecx+8Ch]
+.text:10026471                 cmp     eax, 1244202890
+.text:10026476                 cmovl   edx, edi
+.text:10026479                 mov     edx, [edx]
+.text:1002647B                 add     edx, ebx
+.text:1002647D                 jmp     edx
+```
+
+Khi backward slice từ 0x1002647D thì chưa tìm được giá trị của ECX, nên sẽ tiếp tục backward slice từ `JMP REG` trước đó là 0x10025E4C
+
+### Pattern 2
+
+```assembly
+.text:10025EAC                 mov     eax, 2B083668h
+.text:10025EB1                 cmp     ebp, [esp+64h+var_34]
+.text:10025EB5                 jb      short loc_10025EBC
+.text:10025EB7                 mov     eax, 95275CA9h
+.text:10025EBC
+.text:10025EBC loc_10025EBC:                           ; CODE XREF: fn_decrypt_config+1B5↑j
+.text:10025EBC                 mov     ecx, dword_10040870
+.text:10025EC2                 cmp     eax, 9D0F845h
+.text:10025EC7                 jl      loc_10026441
+.text:10025ECD                 lea     edx, [ecx-679AEA48h]
+.text:10025ED3                 jmp     loc_10026447
+```
+
+```assembly
+.text:10026441 loc_10026441:                           ; CODE XREF: fn_decrypt_config+1C7↑j
+.text:10026441                 lea     edx, [ecx-679AE90Ch]
+.text:10026447
+.text:10026447 loc_10026447:                           ; CODE XREF: fn_decrypt_config+1D3↑j
+.text:10026447                 add     ecx, 986515B4h
+.text:1002644D                 mov     edx, [edx]
+.text:1002644F                 add     edx, ebx
+.text:10026451                 jmp     edx
+```
+
+Pattern này không sử dụng các conditional instruction như `CMOVCC` hay `SETCC` mà setup các tham số cho JMP trước sau đó CMP (Khả năng của obf CFF) rồi có 2 lệnh JMP, 2 lệnh JMP đó đều đi đến `JMP REG` (Mỗi lệnh JMP sẽ là một điều kiện) 
