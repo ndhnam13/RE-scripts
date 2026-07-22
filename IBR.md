@@ -181,7 +181,7 @@ Script tự tạo bytecode cho lệnh jump:
 - Offset được tính: `target - (current_addr + instruction_length)`
 
 1. Thu thập lệnh: Lặp qua tất cả lệnh trong range `[setcc_addr, jmp_addr + jmp_size)` 
-2. Tách lệnh không thuộc slice: Với mỗi lệnh, nếu không thuộc `slice_eas` → lưu lại bytecode gốc. Ví dụ `mov esi, 2` trong ví dụ trên không thuộc slice, bytecode của nó sẽ được giữ lại
+2. Tách lệnh không thuộc slice: Với mỗi lệnh, nếu không thuộc `slice_eas` -> lưu lại bytecode gốc. Ví dụ `mov esi, 2` trong ví dụ trên không thuộc slice, bytecode của nó sẽ được giữ lại
 3. Tạo patch data: Nối theo thứ tự:
    - Bytecode các lệnh không thuộc slice (đặt lên đầu)
    - `Jcc dest_true` (6 bytes): conditional jump đến nhánh True
@@ -223,20 +223,20 @@ Hướng trace ngược vẫn sử dụng đúng ý tưởng backward slicing nh
 
 ## Phân tích pattern mẫu PlugX
 
+Đối với indirect branch của mẫu PlugX này thì tham số để tính toán đích của `JMP REG` sẽ phụ thuộc vào các block trước đó. Vậy nên sẽ không thể liệt kê tất cả `JMP REG` trong một hàm và backward slice từ các địa chỉ đó được do sẽ thiếu dữ liệu => Resolve sai địa chỉ
+
+Vậy sẽ phải resolve từ `JMP REG` đầu tiên và đi theo các địa chỉ đích
+
 ### Pattern 1
 
 Hướng giải quyết:
 
-- Tìm jmp reg đầu hàm sau đó backward slice và symbex resolve được 2 T/F
-
+- Tìm `JMP REG` đầu hàm sau đó backward slice và symbex resolve được 2 T/F
 - Đi đến nhánh T, lưu lại nhánh F
-
 - Lưu lại cả địa chỉ của các nhánh đã được resolve
-
-- Tìm `JMP REG` trong nhánh T, backward slice đến hết nhánh T, nếu `tracked_regs` vẫn còn, tiếp tục backward slice từ địa chỉ của của `JMP REG` nhánh trước đó tiếp tục đến khi không `tracked_regs` rỗng, symbex slice để resolve T/F, lại đi đến nhánh T và lưu lại nhánh F
-
+- Tìm `JMP REG` trong nhánh T, backward slice đến hết nhánh T
+- Nếu `tracked_regs` vẫn còn, tiếp tục backward slice từ địa chỉ của của `JMP REG` nhánh trước đó và tiếp tục đến khi không `tracked_regs` rỗng, symbex slice để resolve T/F, lại đi đến nhánh T và lưu lại nhánh F
 - Đối với các nhánh đã resolve bỏ qua khi gặp lại
-
 - Tiếp tục làm như vậy cho đến khi resolve hết tất cả các nhánh
 
 Ví dụ:
@@ -289,7 +289,7 @@ Sau khi resolve đi tới nhánh True tại 0x10026465, quét từ đây xuống
 .text:1002647D                 jmp     edx
 ```
 
-Khi backward slice từ 0x1002647D thì chưa tìm được giá trị của ECX, nên sẽ tiếp tục backward slice từ `JMP REG` trước đó là 0x10025E4C
+Khi backward slice từ 0x1002647D thì chưa tìm được giá trị của ECX và EBX, nên sẽ tiếp tục backward slice từ `JMP REG` trước đó là 0x10025E4C
 
 ### Pattern 2
 
@@ -305,9 +305,7 @@ Khi backward slice từ 0x1002647D thì chưa tìm được giá trị của ECX
 .text:10025EC7                 jl      loc_10026441
 .text:10025ECD                 lea     edx, [ecx-679AEA48h]
 .text:10025ED3                 jmp     loc_10026447
-```
-
-```assembly
+#.................................................................................................#
 .text:10026441 loc_10026441:                           ; CODE XREF: fn_decrypt_config+1C7↑j
 .text:10026441                 lea     edx, [ecx-679AE90Ch]
 .text:10026447
@@ -318,4 +316,58 @@ Khi backward slice từ 0x1002647D thì chưa tìm được giá trị của ECX
 .text:10026451                 jmp     edx
 ```
 
+```assembly
+.text:10026DF4                 lea     edx, [ecx+60h]
+.text:10026DF7                 cmp     esi, 247009A5h
+.text:10026DFD                 jl      short loc_10026E02
+.text:10026DFF                 lea     edx, [ecx+34h]
+.text:10026E02
+.text:10026E02 loc_10026E02:                           ; CODE XREF: sub_10026DF4+9↑j
+.text:10026E02                 mov     edx, [edx+434C015h]
+.text:10026E08                 add     edx, ebp
+.text:10026E0A                 jmp     edx
+```
+
+Kết quả của `JMP REG` vẫn có 2 địa chỉ đích
+
 Pattern này không sử dụng các conditional instruction như `CMOVCC` hay `SETCC` mà setup các tham số cho JMP trước sau đó CMP (Khả năng của obf CFF) rồi có 2 lệnh JMP, 2 lệnh JMP đó đều đi đến `JMP REG` (Mỗi lệnh JMP sẽ là một điều kiện) 
+
+Hướng xử lí:
+
+- Với mỗi dest của một `JMP REG`, sau khi tìm được `JMP REG`. Từ dest trace xuống tìm pattern `JL ADDR + JMP ADDR`
+- Sau đó backward slice theo 2 hướng: 
+  - Từ địa chỉ `JMP REG` đến hết địa chỉ của `JL ADDR` và các block trước đó, sau đó symbex resolve địa chỉ đích
+  - Từ địa chỉ `JMP REG` đến hết địa chỉ của `JMP ADDR` đến `JL ADDR`, sau đó symbex resolve địa chỉ đích
+  - Sau khi có 2 địa chỉ rồi thì comment
+
+
+Ví dụ:
+
+```assembly
+.text:10025EAC                 mov     eax, 2B083668h
+.text:10025EB1                 cmp     ebp, [esp+64h+var_34]
+.text:10025EB5                 jb      short loc_10025EBC
+.text:10025EB7                 mov     eax, 95275CA9h
+.text:10025EBC
+.text:10025EBC loc_10025EBC:                           ; CODE XREF: fn_decrypt_config+1B5↑j
+.text:10025EBC                 mov     ecx, dword_10040870
+.text:10025EC2                 cmp     eax, 9D0F845h
+.text:10025EC7                 jl      loc_10026441
+.text:10025ECD                 lea     edx, [ecx-679AEA48h]
+.text:10025ED3                 jmp     loc_10026447
+#.................................................................................................#
+.text:10026441 loc_10026441:                           ; CODE XREF: fn_decrypt_config+1C7↑j
+.text:10026441                 lea     edx, [ecx-679AE90Ch]
+.text:10026447
+.text:10026447 loc_10026447:                           ; CODE XREF: fn_decrypt_config+1D3↑j
+.text:10026447                 add     ecx, 986515B4h
+.text:1002644D                 mov     edx, [edx]
+.text:1002644F                 add     edx, ebx
+.text:10026451                 jmp     edx
+```
+
+- Sau khi có địa chỉ `JMP EDX`, `JL loc_10026441`, `JMP loc_10026447`
+  - Đối với nhánh `JL loc_10026441`: Trace ngược từ `JMP EDX` đến hết `0x10026441`, sau đó tiếp tục từ `0x10025EC7` cho đến khi hết `tracked_regs`
+  - Đối với nhánh `JMP loc_10026447`: Trace ngược từ `JMP EDX` đến hết `0x10026447`, sau đó tiếp tục từ `0x10025ED3` đến `0x10025EC7`
+
+### Pattern 3
