@@ -346,8 +346,9 @@ def backward_slice_path(path_history, entry_setup_eas=None):
                 is_overwrite = False
                 if mnem_lower in ['mov', 'movabs', 'movzx', 'movsx', 'lea', 'pop']:
                     is_overwrite = True
-                elif mnem_lower == 'xor' and idc.print_operand(current_addr, 0) == idc.print_operand(current_addr, 1):
+                elif mnem_lower in ['xor', 'sub'] and idc.print_operand(current_addr, 0) == idc.print_operand(current_addr, 1):
                     is_overwrite = True
+                    source_regs = set()
                     
                 if is_overwrite:
                     tracked_regs.remove(dest_reg)
@@ -481,6 +482,37 @@ def emulate_post_cmov(post_eas, dst_reg_family, override_val, pre_regs, machine,
         return int(final_val), updated_regs
     return None, updated_regs
 
+def find_diamond_jcc(jmp_ea):
+    def get_predecessors(ea):
+        preds = []
+        prev_ea = idc.prev_head(ea)
+        if prev_ea != idc.BADADDR:
+            mnem = idc.print_insn_mnem(prev_ea).lower() if idc.is_code(idc.get_full_flags(prev_ea)) else ""
+            if not (mnem == 'jmp' or mnem in ['ret', 'retn']):
+                preds.append(prev_ea)
+        for ref in idautils.CodeRefsTo(ea, 0):
+            if ref not in preds:
+                preds.append(ref)
+        return preds
+
+    queue = [jmp_ea]
+    visited = {jmp_ea}
+    
+    while queue:
+        curr = queue.pop(0)
+        preds = get_predecessors(curr)
+        for p in preds:
+            mnem = idc.print_insn_mnem(p).lower() if idc.is_code(idc.get_full_flags(p)) else ""
+            if mnem.startswith('j') and mnem != 'jmp':
+                target = idc.get_operand_value(p, 0)
+                fallthrough = idc.next_head(p)
+                # Check if both branches can reach the jump (simple check, assume graph is a diamond)
+                return p
+            if p not in visited:
+                visited.add(p)
+                queue.append(p)
+    return None
+
 def resolve_jump_slice(addr, reg, slice_instrs, global_regs, machine, lifter, mdis, container, loc_db, is_64bit):
     cond_idx = -1
     cond_type = None
@@ -553,9 +585,17 @@ def resolve_jump_slice(addr, reg, slice_instrs, global_regs, machine, lifter, md
                 machine, lifter, mdis, container, loc_db, reg, is_64bit
             )
             if dest_true is not None and dest_false is not None:
-                print(f"  [+] Resolved destinations (setcc) -> True: {dest_true:#x} | False: {dest_false:#x}")
-                comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
-                idc.set_cmt(addr, comment, 0)
+                # Validate resolved addresses are within valid segments
+                valid_true = idaapi.getseg(dest_true) is not None
+                valid_false = idaapi.getseg(dest_false) is not None
+                if valid_true and valid_false:
+                    print(f"  [+] Resolved destinations (setcc) -> True: {dest_true:#x} | False: {dest_false:#x}")
+                    comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
+                    idc.set_cmt(addr, comment, 0)
+                else:
+                    print(f"  [?] Resolved addresses out of segment range (setcc) -> True: {dest_true:#x} (valid={valid_true}) | False: {dest_false:#x} (valid={valid_false})")
+                    print(f"  [-] State table data at this offset likely not yet decrypted. Skipping.")
+                    dest_true, dest_false, regs_true = None, None, {}
     elif cond_type == 'cmov':
         cmov_addr, _ = slice_instrs[cond_idx]
         dst_reg = idc.print_operand(cmov_addr, 0)
@@ -594,11 +634,132 @@ def resolve_jump_slice(addr, reg, slice_instrs, global_regs, machine, lifter, md
                 machine, lifter, mdis, container, loc_db, reg, is_64bit
             )
             if dest_true is not None and dest_false is not None:
-                print(f"  [+] Resolved destinations (cmov) -> True: {dest_true:#x} | False: {dest_false:#x}")
-                comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
-                idc.set_cmt(addr, comment, 0)
+                # Validate resolved addresses are within valid segments
+                valid_true = idaapi.getseg(dest_true) is not None
+                valid_false = idaapi.getseg(dest_false) is not None
+                if valid_true and valid_false:
+                    print(f"  [+] Resolved destinations (cmov) -> True: {dest_true:#x} | False: {dest_false:#x}")
+                    comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
+                    idc.set_cmt(addr, comment, 0)
+                else:
+                    print(f"  [?] Resolved addresses out of segment range (cmov) -> True: {dest_true:#x} (valid={valid_true}) | False: {dest_false:#x} (valid={valid_false})")
+                    print(f"  [-] State table data at this offset likely not yet decrypted. Skipping.")
+                    dest_true, dest_false, regs_true = None, None, {}
     else:
-        print(f"  [-] No setcc/cmovcc/lea instruction found in slice for {addr:#x}.")
+        # Check for Diamond Jcc pattern
+        jcc_ea = find_diamond_jcc(addr)
+        if jcc_ea:
+            print(f"  [+] Found Diamond Jcc for {addr:#x} at {jcc_ea:#x}")
+            
+            # Re-slice and evaluate True path
+            target_true = idc.get_operand_value(jcc_ea, 0)
+            print(f"  [+] Tracing True path from Jcc target {target_true:#x}")
+            path_true = []
+            curr = target_true
+            count = 0
+            while curr != addr and curr != idc.BADADDR and count < 100:
+                path_true.append(curr)
+                mnem = idc.print_insn_mnem(curr).lower()
+                if mnem == 'jmp':
+                    curr = idc.get_operand_value(curr, 0)
+                else:
+                    curr = idc.next_head(curr)
+                count += 1
+            path_true.append(addr)
+            
+            # Trace False path
+            target_false = idc.next_head(jcc_ea)
+            print(f"  [+] Tracing False path from Jcc fallthrough {target_false:#x}")
+            path_false = []
+            curr = target_false
+            count = 0
+            while curr != addr and curr != idc.BADADDR and count < 100:
+                path_false.append(curr)
+                mnem = idc.print_insn_mnem(curr).lower()
+                if mnem == 'jmp':
+                    curr = idc.get_operand_value(curr, 0)
+                else:
+                    curr = idc.next_head(curr)
+                count += 1
+            path_false.append(addr)
+            
+            # Determine common prefix (instructions before the diamond split)
+            diamond_body = set(path_true + path_false)
+            prefix_instrs = [item for item in slice_instrs if item[0] not in diamond_body]
+            
+            asmcfg_true = AsmCFG(loc_db)
+            block_true = AsmBlock(loc_db, loc_db.gen_loc_key())
+            for ea, _ in prefix_instrs:
+                block_true.lines.append(mdis.dis_instr(ea))
+            for ea in path_true[:-1]: # exclude JMP REG
+                block_true.lines.append(mdis.dis_instr(ea))
+            asmcfg_true.add_block(block_true)
+            ircfg_true = lifter.new_ircfg_from_asmcfg(asmcfg_true)
+            
+            init_state_true = {}
+            reg_size = 64 if is_64bit else 32
+            for reg_name, val in global_regs.items():
+                init_state_true[ExprId(reg_name.upper(), reg_size)] = ExprInt(val, reg_size)
+            engine_true = IDASymbolicExecutionEngine(lifter, container, init_state_true)
+            if list(ircfg_true.blocks.values()):
+                engine_true.eval_updt_irblock(list(ircfg_true.blocks.values())[0])
+            jmp_reg_full = family_to_reg(get_reg_family(reg), is_64bit)
+            if jmp_reg_full:
+                final_val_true = engine_true.eval_expr(ExprId(jmp_reg_full.upper(), reg_size))
+            else:
+                final_val_true = engine_true.eval_expr(ExprId(reg.upper(), reg_size))
+            
+            dest_true = None
+            if isinstance(final_val_true, ExprInt):
+                dest_true = int(final_val_true)
+            
+            asmcfg_false = AsmCFG(loc_db)
+            block_false = AsmBlock(loc_db, loc_db.gen_loc_key())
+            for ea, _ in prefix_instrs:
+                block_false.lines.append(mdis.dis_instr(ea))
+            for ea in path_false[:-1]: # exclude JMP REG
+                block_false.lines.append(mdis.dis_instr(ea))
+            asmcfg_false.add_block(block_false)
+            ircfg_false = lifter.new_ircfg_from_asmcfg(asmcfg_false)
+            
+            init_state_false = {}
+            for reg_name, val in global_regs.items():
+                init_state_false[ExprId(reg_name.upper(), reg_size)] = ExprInt(val, reg_size)
+            engine_false = IDASymbolicExecutionEngine(lifter, container, init_state_false)
+            if list(ircfg_false.blocks.values()):
+                engine_false.eval_updt_irblock(list(ircfg_false.blocks.values())[0])
+            if jmp_reg_full:
+                final_val_false = engine_false.eval_expr(ExprId(jmp_reg_full.upper(), reg_size))
+            else:
+                final_val_false = engine_false.eval_expr(ExprId(reg.upper(), reg_size))
+                
+            if isinstance(final_val_false, ExprInt):
+                dest_false = int(final_val_false)
+
+            if dest_true is not None and dest_false is not None:
+                # Validate resolved addresses are within valid segments
+                valid_true = idaapi.getseg(dest_true) is not None
+                valid_false = idaapi.getseg(dest_false) is not None
+                if valid_true and valid_false:
+                    print(f"  [+] Resolved destinations (diamond jcc) -> True: {dest_true:#x} | False: {dest_false:#x}")
+                    comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
+                    idc.set_cmt(addr, comment, 0)
+                    
+                    if is_64bit:
+                        GP_REGS = ['RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'RSP', 'RBP', 'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15']
+                    else:
+                        GP_REGS = ['EAX', 'EBX', 'ECX', 'EDX', 'ESI', 'EDI', 'ESP', 'EBP']
+                    for reg_name in GP_REGS:
+                        r_id = ExprId(reg_name, reg_size)
+                        val = engine_true.symbols.read(r_id)
+                        if isinstance(val, ExprInt):
+                            regs_true[reg_name] = int(val)
+                else:
+                    print(f"  [?] Resolved addresses out of segment range (diamond jcc) -> True: {dest_true:#x} (valid={valid_true}) | False: {dest_false:#x} (valid={valid_false})")
+                    print(f"  [-] State table data at this offset likely not yet decrypted. Skipping.")
+                    dest_true, dest_false = None, None
+        else:
+            print(f"  [-] No setcc/cmovcc/lea/diamond instruction found in slice for {addr:#x}.")
 
     return dest_true, dest_false, regs_true
 
