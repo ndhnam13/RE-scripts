@@ -13,92 +13,6 @@ from miasm.core.asmblock import AsmCFG, AsmBlock
 from miasm.ir.symbexec import SymbolicExecutionEngine
 from miasm.expression.expression import ExprInt, ExprId
 
-cond_jump_insts = {
-    'jo': b'\x0f\x80', 'jno': b'\x0f\x81', 
-    'js': b'\x0f\x88', 'jns': b'\x0f\x89', 
-    'je': b'\x0f\x84', 'jz': b'\x0f\x84', 
-    'jne': b'\x0f\x85', 'jnz': b'\x0f\x85', 
-    'jb': b'\x0f\x82', 'jnae': b'\x0f\x82', 
-    'jae': b'\x0f\x83', 'jnb': b'\x0f\x83', 
-    'jbe': b'\x0f\x86', 'jna': b'\x0f\x86', 
-    'ja': b'\x0f\x87', 'jnbe': b'\x0f\x87', 
-    'jl': b'\x0f\x8c', 'jnge': b'\x0f\x8c', 
-    'jge': b'\x0f\x8d', 'jnl': b'\x0f\x8d', 
-    'jle': b'\x0f\x8e', 'jng': b'\x0f\x8e', 
-    'jg': b'\x0f\x8f', 'jnle': b'\x0f\x8f', 
-    'jp': b'\x0f\x8a', 'jpe': b'\x0f\x8a', 
-    'jnp': b'\x0f\x8b', 'jpo': b'\x0f\x8b'
-}
-
-def assemble_jump(target, current_addr, cond=None):
-    if cond is not None:
-        jcc_name = 'j' + cond
-        opcode = cond_jump_insts.get(jcc_name)
-        if opcode is None:
-            raise ValueError(f"Unknown condition: {cond}")
-        inst_len = 6
-        offset = target - (current_addr + inst_len)
-        return opcode + offset.to_bytes(4, 'little', signed=True)
-    else:
-        opcode = b"\xE9"
-        inst_len = 5
-        offset = target - (current_addr + inst_len)
-        return opcode + offset.to_bytes(4, 'little', signed=True)
-
-def patch_indirect_jump_restore_non_slice(setcc_addr, jmp_addr, jmp_size, slice_eas, dest_true, dest_false, cond):
-    patch_size = (jmp_addr + jmp_size) - setcc_addr
-    
-    # 1. Collect all instructions in the range [setcc_addr, jmp_addr + jmp_size)
-    range_instrs = []
-    curr = setcc_addr
-    while curr < jmp_addr + jmp_size:
-        size = idc.get_item_size(curr)
-        if size <= 0:
-            print(f"  [-] Error: invalid instruction size {size} at {curr:#x}")
-            return False
-        range_instrs.append((curr, size))
-        curr += size
-        
-    # 2. Extract and concatenate bytes of all non-slice instructions
-    non_slice_bytes = b""
-    non_slice_size = 0
-    for ea, size in range_instrs:
-        if ea not in slice_eas:
-            bytes_data = idc.get_bytes(ea, size)
-            if bytes_data:
-                non_slice_bytes += bytes_data
-                non_slice_size += size
-                print(f"  [+] Saving non-slice instruction at {ea:#x} (size {size}): {idc.generate_disasm_line(ea, 0)}")
-                
-    # 3. Assemble patch: Non-slice instructions + Jcc (6 bytes) + Jmp (5 bytes)
-    jcc_addr = setcc_addr + non_slice_size
-    jmp_addr_part = jcc_addr + 6
-    
-    patch_data = non_slice_bytes
-    patch_data += assemble_jump(dest_true, jcc_addr, cond=cond)
-    patch_data += assemble_jump(dest_false, jmp_addr_part)
-    
-    if len(patch_data) < patch_size:
-        patch_data += b"\x90" * (patch_size - len(patch_data))
-    elif len(patch_data) > patch_size:
-        print(f"  [-] Error: patch data ({len(patch_data)}) exceeds patch size ({patch_size})")
-        return False
-        
-    # 4. Apply patch to IDA database
-    ida_bytes.del_items(setcc_addr, ida_bytes.DELIT_SIMPLE, patch_size)
-    ida_bytes.patch_bytes(setcc_addr, patch_data)
-    
-    # 5. Re-create instructions in the patched range
-    curr_patch = setcc_addr
-    while curr_patch < setcc_addr + patch_size:
-        ida_ua.create_insn(curr_patch)
-        new_size = idc.get_item_size(curr_patch)
-        if new_size <= 0:
-            new_size = 1
-        curr_patch += new_size
-        
-    return True
-
 REG_FAMILIES = {
     'rax': {'rax', 'eax', 'ax', 'al', 'ah'},
     'rbx': {'rbx', 'ebx', 'bx', 'bl', 'bh'},
@@ -560,11 +474,6 @@ def resolve_jump_slice(addr, reg, slice_instrs, global_regs, machine, lifter, md
                 print(f"  [+] Resolved destinations (lea) -> True: {dest_true:#x} | False: {dest_false:#x}")
                 comment = f"True: {dest_true:#x}\nFalse: {dest_false:#x}"
                 idc.set_cmt(addr, comment, 0)
-                
-                jmp_size = idc.get_item_size(addr)
-                cond_name = "nz"
-                slice_eas = {item[0] for item in slice_instrs}
-                patch_indirect_jump_restore_non_slice(lea_addr, addr, jmp_size, slice_eas, dest_true, dest_false, cond_name)
     elif cond_type == 'setcc':
         setcc_addr, _ = slice_instrs[cond_idx]
         setcc_reg = idc.print_operand(setcc_addr, 0)
